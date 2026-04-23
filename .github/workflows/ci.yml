@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-backend:
+    name: Lint backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install lint tools
+        run: pip install ruff mypy
+
+      - name: Ruff
+        run: ruff check src/
+
+      - name: Mypy
+        run: mypy src/ --ignore-missing-imports
+
+  test-backend:
+    name: Test backend
+    needs: lint-backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - "27017:27017"
+      redis:
+        image: redis:7-alpine
+        ports:
+          - "6379:6379"
+      qdrant:
+        image: qdrant/qdrant
+        ports:
+          - "6333:6333"
+    env:
+      ENVIRONMENT: test
+      SECRET_KEY: ci-secret-key
+      ADMIN_API_KEY: sk-admin-ci-test-key
+      OPENAI_API_KEY: sk-ci-test-key
+      OPENAI_MODEL: gpt-3.5-turbo
+      OPENAI_EMBEDDING_MODEL: text-embedding-ada-002
+      MONGO_URL: mongodb://localhost:27017
+      MONGO_DB_NAME: minirag_test
+      REDIS_URL: redis://localhost:6379
+      QDRANT_URL: http://localhost:6333
+      STARTUP_TIMEOUT_SECONDS: "5"
+      SERVICE_CHECK_TIMEOUT_SECONDS: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Wait for services
+        run: |
+          python - <<'PY'
+          import socket
+          import time
+          import urllib.request
+
+          def wait_port(host: str, port: int, timeout: int = 60) -> None:
+              deadline = time.time() + timeout
+              while time.time() < deadline:
+                  try:
+                      with socket.create_connection((host, port), timeout=2):
+                          return
+                  except OSError:
+                      time.sleep(2)
+              raise SystemExit(f"Timed out waiting for {host}:{port}")
+
+          wait_port("127.0.0.1", 27017)
+          wait_port("127.0.0.1", 6379)
+
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:6333/readyz", timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except Exception:
+                  time.sleep(2)
+          else:
+              raise SystemExit("Timed out waiting for qdrant /readyz")
+          PY
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --cov=src --cov-report=xml -m "not slow"
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          if-no-files-found: error
+
+  lint-and-test-frontend:
+    name: Lint and test frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-node-18-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-18-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test -- --passWithNoTests
+
+  integration-test:
+    name: Integration test
+    needs:
+      - test-backend
+      - lint-and-test-frontend
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create CI env
+        run: |
+          cat > .env <<'EOF'
+          OPENAI_API_KEY=sk-ci-test-key
+          OPENAI_MODEL=gpt-3.5-turbo
+          OPENAI_EMBEDDING_MODEL=text-embedding-ada-002
+          OPENAI_EMBEDDING_DIMENSIONS=1536
+          MONGO_INITDB_ROOT_USERNAME=admin
+          MONGO_INITDB_ROOT_PASSWORD=change_this_to_a_strong_password_min_16_chars
+          MONGO_URL=mongodb://admin:change_this_to_a_strong_password_min_16_chars@mongodb:27017
+          MONGO_DB_NAME=minirag_ci
+          REDIS_URL=redis://redis:6379
+          QDRANT_URL=http://qdrant:6333
+          SECRET_KEY=ci-secret-key
+          ADMIN_API_KEY=sk-admin-ci-test-key
+          NEXT_PUBLIC_API_URL=http://fastapi:8000
+          ENVIRONMENT=test
+          LOG_LEVEL=INFO
+          STARTUP_TIMEOUT_SECONDS=5
+          SERVICE_CHECK_TIMEOUT_SECONDS=2
+          ALLOWED_ORIGINS=["http://localhost","http://localhost:3000"]
+          EOF
+          cat > docker-compose.ci.yml <<'EOF'
+          services:
+            fastapi:
+              ports:
+                - "8000:8000"
+            nextjs:
+              ports:
+                - "3000:3000"
+          EOF
+
+      - name: Start Docker Compose
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build mongodb redis qdrant fastapi celery-worker celery-beat nextjs nginx
+
+      - name: Wait for FastAPI
+        run: |
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml ps
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml logs fastapi
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install test requirements
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Run integration tests
+        working-directory: backend
+        run: pytest tests/integration/ -v
+
+      - name: Print Docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml logs --no-color
+
+      - name: Tear down Docker Compose
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml down -v --remove-orphans

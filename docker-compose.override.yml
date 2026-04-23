@@ -1,0 +1,99 @@
+services:
+  fastapi:
+    command:
+      [
+        "uvicorn",
+        "src.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+      ]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/src:/app/src
+      - backend_storage:/app/storage
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  celery-worker:
+    volumes:
+      - ./backend/src:/app/src
+      - backend_storage:/app/storage
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 2G
+
+  celery-beat:
+    volumes:
+      - ./backend/src:/app/src
+      - backend_storage:/app/storage
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  flower:
+    volumes:
+      - ./backend/src:/app/src
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  nextjs:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: builder
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://fastapi:8000}
+    command: >
+      sh -c "if [ ! -d node_modules/next ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+      npm install;
+      fi;
+      npm run dev -- --hostname 0.0.0.0 --port 3000"
+    environment:
+      NODE_ENV: development
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://fastapi:8000}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  mongodb:
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  qdrant:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  nginx:
+    deploy:
+      resources:
+        limits:
+          memory: 128M
